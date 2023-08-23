@@ -38,6 +38,7 @@ public PressureForce_FV_Bouss, PressureForce_FV_nonBouss
 type, public :: PressureForce_FV_CS ; private
   logical :: initialized = .false. !< True if this control structure has been initialized.
   logical :: calculate_SAL  !< If true, calculate self-attraction and loading.
+  logical :: use_SAL_pcm    !< If true, use predictor-corrector method when applying SAL.
   logical :: tides          !< If true, apply tidal momentum forcing.
   real    :: Rho0           !< The density used in the Boussinesq
                             !! approximation [R ~> kg m-3].
@@ -446,7 +447,7 @@ end subroutine PressureForce_FV_nonBouss
 !! To work, the following fields must be set outside of the usual (is:ie,js:je)
 !! range before this subroutine is called:
 !!   h(isB:ie+1,jsB:je+1), T(isB:ie+1,jsB:je+1), and S(isB:ie+1,jsB:je+1).
-subroutine PressureForce_FV_Bouss(h, tv, PFu, PFv, G, GV, US, CS, ALE_CSp, p_atm, pbce, eta)
+subroutine PressureForce_FV_Bouss(h, tv, PFu, PFv, G, GV, US, CS, ALE_CSp, p_atm, pbce, eta, e_SAL_only)
   type(ocean_grid_type),                      intent(in)  :: G   !< Ocean grid structure
   type(verticalGrid_type),                    intent(in)  :: GV  !< Vertical grid structure
   type(unit_scale_type),                      intent(in)  :: US  !< A dimensional unit scaling type
@@ -462,8 +463,12 @@ subroutine PressureForce_FV_Bouss(h, tv, PFu, PFv, G, GV, US, CS, ALE_CSp, p_atm
                                                          !! anomaly in each layer due to eta anomalies
                                                          !! [L2 T-2 H-1 ~> m s-2].
   real, dimension(SZI_(G),SZJ_(G)),          optional, intent(out) :: eta !< The sea-surface height used to
-                                                         !! calculate PFu and PFv [H ~> m], with any
+                                                         !! calculate PFu and PFv [Z ~> m], with any
                                                          !! tidal contributions.
+  real, dimension(SZI_(G),SZJ_(G)),          optional, intent(out) :: e_SAL_only !< The sea-surface height used to
+                                                         !! calculate PFu and PFv [Z ~> m], only from SAL
+                                                         !! contributions...this will need to include tides if
+                                                         !! we let astronomical forcing vary over BT steps.
   ! Local variables
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)+1) :: e ! Interface height in depth units [Z ~> m].
   real, dimension(SZI_(G),SZJ_(G))  :: &
@@ -903,6 +908,18 @@ subroutine PressureForce_FV_Bouss(h, tv, PFu, PFv, G, GV, US, CS, ALE_CSp, p_atm
   if (CS%id_rho_stanley_pgf>0) call post_data(CS%id_rho_stanley_pgf, rho_stanley_pgf, CS%diag)
   if (CS%id_p_stanley>0) call post_data(CS%id_p_stanley, p_stanley, CS%diag)
 
+  ! If using the predictor-corrector method for SAL, define the SSH perturbation due
+  ! to SAL only.
+  if ((CS%calculate_SAL) .and. (CS%use_SAL_pcm)) then
+    if (present(e_SAL_only)) then
+      do j=Jsq,Jeq+1 ; do i=Isq,Ieq+1
+        e_SAL_only(i,j) = e_sal(i,j)
+      enddo ; enddo
+    else
+      ! should probably throw a warning or error
+    endif
+  endif
+
 end subroutine PressureForce_FV_Bouss
 
 !> Initializes the finite volume pressure gradient control structure
@@ -955,6 +972,9 @@ subroutine PressureForce_FV_init(Time, G, GV, US, param_file, diag, CS, SAL_CSp,
   endif
   call get_param(param_file, mdl, "CALCULATE_SAL", CS%calculate_SAL, &
                  "If true, calculate self-attraction and loading.", default=CS%tides)
+  call get_param(param_file, mdl, "USE_SAL_PCM", CS%use_SAL_pcm, &
+                 "If true, use a predictor-corrector method for calculating pressure force "//&
+                  "due to SAL on barotropic time steps.", default=.false.)
   call get_param(param_file, "MOM", "USE_REGRIDDING", use_ALE, &
                  "If True, use the ALE algorithm (regridding/remapping). "//&
                  "If False, use the layered isopycnal algorithm.", default=.false. )

@@ -29,6 +29,7 @@ public PressureForce, PressureForce_init
 type, public :: PressureForce_CS ; private
   logical :: Analytic_FV_PGF !< If true, use the analytic finite volume form
                              !! (Adcroft et al., Ocean Mod. 2008) of the PGF.
+  logical :: use_SAL_pcm          !< If true, use predictor-corrector method to apply SAL.
   !> Control structure for the analytically integrated finite volume pressure force
   type(PressureForce_FV_CS) :: PressureForce_FV
   !> Control structure for the Montgomery potential form of pressure force
@@ -38,7 +39,7 @@ end type PressureForce_CS
 contains
 
 !> A thin layer between the model and the Boussinesq and non-Boussinesq pressure force routines.
-subroutine PressureForce(h, tv, PFu, PFv, G, GV, US, CS, ALE_CSp, p_atm, pbce, eta)
+subroutine PressureForce(h, tv, PFu, PFv, G, GV, US, CS, ALE_CSp, p_atm, pbce, eta, e_SAL_only)
   type(ocean_grid_type),   intent(in)  :: G    !< The ocean's grid structure
   type(verticalGrid_type), intent(in)  :: GV   !< The ocean's vertical grid structure
   type(unit_scale_type),   intent(in)  :: US   !< A dimensional unit scaling type
@@ -59,11 +60,20 @@ subroutine PressureForce(h, tv, PFu, PFv, G, GV, US, CS, ALE_CSp, p_atm, pbce, e
   real, dimension(SZI_(G),SZJ_(G)), &
                  optional, intent(out) :: eta  !< The bottom mass used to calculate PFu and PFv,
                                                !! [H ~> m or kg m-2], with any tidal contributions.
+  real, dimension(SZI_(G),SZJ_(G)),          optional, intent(out) :: e_SAL_only  !< The sea-surface height used to
+                 !! calculate PFu and PFv [Z ~> m], only from SAL
+                 !! contributions...this will need to include tides if
+                 !! we let astronomical forcing vary over BT steps.
 
   if (CS%Analytic_FV_PGF) then
     if (GV%Boussinesq) then
-      call PressureForce_FV_Bouss(h, tv, PFu, PFv, G, GV, US, CS%PressureForce_FV, &
-                                   ALE_CSp, p_atm, pbce, eta)
+      if (CS%use_SAL_pcm) then
+        call PressureForce_FV_Bouss(h, tv, PFu, PFv, G, GV, US, CS%PressureForce_FV, &
+                                    ALE_CSp, p_atm, pbce, eta, e_SAL_only)
+      else
+        call PressureForce_FV_Bouss(h, tv, PFu, PFv, G, GV, US, CS%PressureForce_FV, &
+                                    ALE_CSp, p_atm, pbce, eta)
+      endif
     else
       call PressureForce_FV_nonBouss(h, tv, PFu, PFv, G, GV, US, CS%PressureForce_FV, &
                                       ALE_CSp, p_atm, pbce, eta)
@@ -102,7 +112,9 @@ subroutine PressureForce_init(Time, G, GV, US, param_file, diag, CS, SAL_CSp, ti
                  "the equations of state in pressure to avoid any "//&
                  "possibility of numerical thermobaric instability, as "//&
                  "described in Adcroft et al., O. Mod. (2008).", default=.true.)
-
+  call get_param(param_file, mdl, "USE_SAL_PCM", CS%use_SAL_pcm, &
+                 "If true, use a predictor-corrector method for calculating pressure force "//&
+                  "due to SAL on barotropic time steps.", default=.false.)
   if (CS%Analytic_FV_PGF) then
     call PressureForce_FV_init(Time, G, GV, US, param_file, diag, &
              CS%PressureForce_FV, SAL_CSp, tides_CSp)

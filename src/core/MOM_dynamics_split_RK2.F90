@@ -162,6 +162,7 @@ type, public :: MOM_dyn_split_RK2_CS ; private
                                   !! predictor step.  This is used to accomodate various generations
                                   !! of restart files.
   logical :: calculate_SAL        !< If true, calculate self-attraction and loading.
+  logical :: use_SAL_pcm          !< If true, use predictor-corrector method to apply SAL.
   logical :: use_tides            !< If true, tidal forcing is enabled.
   logical :: remap_aux            !< If true, apply ALE remapping to all of the auxiliary 3-D
                                   !! variables that are needed to reproduce across restarts,
@@ -346,6 +347,15 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
   real, dimension(SZI_(G),SZJ_(G)) :: deta_dt  ! A diagnostic of the time derivative of the free surface
                                                ! height or column mass [H T-1 ~> m s-1 or kg m-2 s-1]
 
+  real, dimension(SZI_(G),SZJ_(G)) :: e_SAL_only              ! The explicitly evaluated SSH perturbation due to SAL,
+                                                              ! calculated on baroclinic time steps [Z ~> m]
+  real, dimension(SZI_(G),SZJ_(G),3) :: e_SAL_pcm             ! Values of e_SAL_only from the last three baroclinic
+                                                              ! steps, to be used in predictor-corrector scheme in btstep()
+                                                              ! [Z ~> m]
+  real, dimension(SZI_(G),SZJ_(G)) :: e_SAL_pred_BT_last      ! Values of e_SAL_only from EITHER the last baroclinic step OR predictor step
+                                                              ! of SAL SSH to be used in predictor-corrector scheme in btstep()
+                                                              ! [Z ~> m]
+
   real, dimension(SZIB_(G),SZJ_(G),SZK_(GV)) :: u_old_rad_OBC ! The starting zonal velocities, which are
                                 ! saved for use in the Flather open boundary condition code [L T-1 ~> m s-1]
   real, dimension(SZI_(G),SZJB_(G),SZK_(GV)) :: v_old_rad_OBC ! The starting meridional velocities, which are
@@ -470,8 +480,21 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
 ! pbce = dM/deta
   if (CS%begw == 0.0) call enable_averages(dt, Time_local, CS%diag)
   call cpu_clock_begin(id_clock_pres)
-  call PressureForce(h, tv, CS%PFu, CS%PFv, G, GV, US, CS%PressureForce_CSp, &
-                     CS%ALE_CSp, p_surf, CS%pbce, CS%eta_PF)
+  if (CS%use_SAL_pcm) then
+    call PressureForce(h, tv, CS%PFu, CS%PFv, G, GV, US, CS%PressureForce_CSp, &
+                      CS%ALE_CSp, p_surf, CS%pbce, CS%eta_PF, e_SAL_only)
+  else
+    call PressureForce(h, tv, CS%PFu, CS%PFv, G, GV, US, CS%PressureForce_CSp, &
+                      CS%ALE_CSp, p_surf, CS%pbce, CS%eta_PF)
+  endif    
+  ! Update structure used in SAL predictor-corrector scheme
+  if (CS%use_SAL_pcm) then
+    do j=Jsq,Jeq+1 ; do i=Isq,Ieq+1
+      e_SAL_pcm(i,j,3) = e_sal_pcm(i,j,2)
+      e_SAL_pcm(i,j,2) = e_sal_pcm(i,j,1)
+      e_SAL_pcm(i,j,1) = e_SAL_only(i,j)
+    enddo ; enddo
+  endif
   if (dyn_p_surf) then
     pres_to_eta = 1.0 / (GV%g_Earth * GV%H_to_RZ)
     !$OMP parallel do default(shared)
@@ -620,10 +643,19 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
   if (showCallTree) call callTree_enter("btstep(), MOM_barotropic.F90")
   ! This is the predictor step call to btstep.
   ! The CS%ADp argument here stores the weights for certain integrated diagnostics.
-  call btstep(u, v, eta, dt, u_bc_accel, v_bc_accel, forces, CS%pbce, CS%eta_PF, u_av, v_av, &
-              CS%u_accel_bt, CS%v_accel_bt, eta_pred, CS%uhbt, CS%vhbt, G, GV, US, &
-              CS%barotropic_CSp, CS%visc_rem_u, CS%visc_rem_v, CS%ADp, CS%OBC, CS%BT_cont, &
-              eta_PF_start, taux_bot, tauy_bot, uh_ptr, vh_ptr, u_ptr, v_ptr)
+  if (CS%use_SAL_pcm) then
+    call btstep(u, v, eta, dt, u_bc_accel, v_bc_accel, forces, CS%pbce, CS%eta_PF, u_av, v_av, &
+                CS%u_accel_bt, CS%v_accel_bt, eta_pred, CS%uhbt, CS%vhbt, G, GV, US, &
+                CS%barotropic_CSp, CS%visc_rem_u, CS%visc_rem_v, CS%ADp, CS%OBC, CS%BT_cont, &
+                eta_PF_start, taux_bot, tauy_bot, uh_ptr, vh_ptr, u_ptr, v_ptr, &
+                e_SAL_pred=e_SAL_pcm, pred_corr_T_F=.true., &
+                e_SAL_pred_BT_last=e_SAL_pred_BT_last)
+  else
+    call btstep(u, v, eta, dt, u_bc_accel, v_bc_accel, forces, CS%pbce, CS%eta_PF, u_av, v_av, &
+                CS%u_accel_bt, CS%v_accel_bt, eta_pred, CS%uhbt, CS%vhbt, G, GV, US, &
+                CS%barotropic_CSp, CS%visc_rem_u, CS%visc_rem_v, CS%ADp, CS%OBC, CS%BT_cont, &
+                eta_PF_start, taux_bot, tauy_bot, uh_ptr, vh_ptr, u_ptr, v_ptr)
+  endif
   if (showCallTree) call callTree_leave("btstep()")
   call cpu_clock_end(id_clock_btstep)
 
@@ -742,8 +774,22 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
     ! PFu = d/dx M(hp,T,S)
     ! pbce = dM/deta
     call cpu_clock_begin(id_clock_pres)
-    call PressureForce(hp, tv, CS%PFu, CS%PFv, G, GV, US, CS%PressureForce_CSp, &
-                       CS%ALE_CSp, p_surf, CS%pbce, CS%eta_PF)
+    if (CS%use_SAL_pcm) then
+      call PressureForce(hp, tv, CS%PFu, CS%PFv, G, GV, US, CS%PressureForce_CSp, &
+                        CS%ALE_CSp, p_surf, CS%pbce, CS%eta_PF, e_SAL_only)
+    else
+      call PressureForce(hp, tv, CS%PFu, CS%PFv, G, GV, US, CS%PressureForce_CSp, &
+                        CS%ALE_CSp, p_surf, CS%pbce, CS%eta_PF)
+    endif
+    ! Update structure used in SAL predictor-corrector scheme
+    if (CS%use_SAL_pcm) then
+      do j=Jsq,Jeq+1 ; do i=Isq,Ieq+1
+        ! This value can either be from the predictor step of SAL SSH in btstep()
+        ! or from the corrector call to PressureForce().
+        ! Here, it is from the former.
+        e_SAL_pcm(i,j,1) = e_SAL_pred_BT_last(i,j)
+      enddo ; enddo
+    endif
     ! Stokes shear force contribution to pressure gradient
     Use_Stokes_PGF = present(Waves)
     if (Use_Stokes_PGF) then
@@ -840,10 +886,20 @@ subroutine step_MOM_dyn_split_RK2(u, v, h, tv, visc, Time_local, dt, forces, p_s
 
   if (showCallTree) call callTree_enter("btstep(), MOM_barotropic.F90")
   ! This is the corrector step call to btstep.
-  call btstep(u, v, eta, dt, u_bc_accel, v_bc_accel, forces, CS%pbce, CS%eta_PF, u_av, v_av, &
-              CS%u_accel_bt, CS%v_accel_bt, eta_pred, CS%uhbt, CS%vhbt, G, GV, US, &
-              CS%barotropic_CSp, CS%visc_rem_u, CS%visc_rem_v, CS%ADp, CS%OBC, CS%BT_cont, &
-              eta_PF_start, taux_bot, tauy_bot, uh_ptr, vh_ptr, u_ptr, v_ptr, etaav=eta_av)
+  if (CS%use_SAL_pcm) then
+    call btstep(u, v, eta, dt, u_bc_accel, v_bc_accel, forces, CS%pbce, CS%eta_PF, u_av, v_av, &
+                CS%u_accel_bt, CS%v_accel_bt, eta_pred, CS%uhbt, CS%vhbt, G, GV, US, &
+                CS%barotropic_CSp, CS%visc_rem_u, CS%visc_rem_v, CS%ADp, CS%OBC, CS%BT_cont, &
+                eta_PF_start, taux_bot, tauy_bot, uh_ptr, vh_ptr, u_ptr, v_ptr, &
+                e_SAL_pred=e_SAL_pcm, pred_corr_T_F=.false., &
+                e_SAL_pred_BT_last=e_SAL_pred_BT_last, etaav=eta_av)
+  else
+    call btstep(u, v, eta, dt, u_bc_accel, v_bc_accel, forces, CS%pbce, CS%eta_PF, u_av, v_av, &
+                CS%u_accel_bt, CS%v_accel_bt, eta_pred, CS%uhbt, CS%vhbt, G, GV, US, &
+                CS%barotropic_CSp, CS%visc_rem_u, CS%visc_rem_v, CS%ADp, CS%OBC, CS%BT_cont, &
+                eta_PF_start, taux_bot, tauy_bot, uh_ptr, vh_ptr, u_ptr, v_ptr,etaav=eta_av)
+  endif
+
   if (CS%id_deta_dt>0) then
     do j=js,je ; do i=is,ie ; deta_dt(i,j) = (eta_pred(i,j) - eta(i,j))*Idt_bc ; enddo ; enddo
   endif
@@ -1277,6 +1333,9 @@ subroutine initialize_dyn_split_RK2(u, v, h, uh, vh, eta, Time, G, GV, US, param
                  "If true, apply tidal momentum forcing.", default=.false.)
   call get_param(param_file, mdl, "CALCULATE_SAL", CS%calculate_SAL, &
                  "If true, calculate self-attraction and loading.", default=CS%use_tides)
+  call get_param(param_file, mdl, "USE_SAL_PCM", CS%use_SAL_pcm, &
+                 "If true, use a predictor-corrector method for calculating pressure force "//&
+                  "due to SAL on barotropic time steps.", default=.false.)
   call get_param(param_file, mdl, "BE", CS%be, &
                  "If SPLIT is true, BE determines the relative weighting "//&
                  "of a  2nd-order Runga-Kutta baroclinic time stepping "//&

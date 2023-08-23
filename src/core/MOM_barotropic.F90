@@ -156,6 +156,7 @@ type, public :: barotropic_CS ; private
   type(BT_OBC_type) :: BT_OBC !< A structure with all of this modules fields
                               !! for applying open boundary conditions.
 
+  real    :: GFS             !< Reduced gravity at free surface [m s-2]
   real    :: dtbt            !< The barotropic time step [T ~> s].
   real    :: dtbt_fraction   !<   The fraction of the maximum time-step that
                              !! should used [nondim].  The default is 0.98.
@@ -226,6 +227,7 @@ type, public :: barotropic_CS ; private
                              !! pressure [nondim].  Stable values are < ~1.0.
                              !! The default is 0.9.
   logical :: calculate_SAL   !< If true, calculate self-attration and loading.
+  logical :: use_SAL_pcm          !< If true, use predictor-corrector method to apply SAL.
   logical :: tidal_sal_bug   !< If true, the tidal self-attraction and loading anomaly in the
                              !! barotropic solver has the wrong sign, replicating a long-standing
                              !! bug.
@@ -415,7 +417,8 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
                   eta_PF_in, U_Cor, V_Cor, accel_layer_u, accel_layer_v, &
                   eta_out, uhbtav, vhbtav, G, GV, US, CS, &
                   visc_rem_u, visc_rem_v, ADp, OBC, BT_cont, eta_PF_start, &
-                  taux_bot, tauy_bot, uh0, vh0, u_uh0, v_vh0, etaav)
+                  taux_bot, tauy_bot, uh0, vh0, u_uh0, v_vh0, &
+                  e_SAL_pred,pred_corr_T_F,e_SAL_pred_BT_last,etaav)
   type(ocean_grid_type),                   intent(inout) :: G       !< The ocean's grid structure.
   type(verticalGrid_type),                   intent(in)  :: GV      !< The ocean's vertical grid structure.
   type(unit_scale_type),                     intent(in)  :: US      !< A dimensional unit scaling type
@@ -484,6 +487,14 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
                                                                     !! velocities [H L2 T-1 ~> m3 s-1 or kg s-1].
   real, dimension(:,:,:),                     pointer    :: v_vh0   !< The velocities used to calculate
                                                                     !! vh0 [L T-1 ~> m s-1]
+
+  logical, optional,                          intent(in) :: pred_corr_T_F           !< True: this is a predictor step
+                                                                                    !! False: this is a corrector step
+  real, dimension(SZI_(G),SZJ_(G),3), optional, intent(in) :: e_SAL_pred            !< The SSH perturbation due to SAL, used in
+                                                                                    !! predictor-corrector scheme [H ~> m]. 
+  real, dimension(SZI_(G),SZJ_(G)), optional, intent(out) :: e_SAL_pred_BT_last     !< The SSH perturbation due to SAL, used in
+                                                                                    !! predictor-corrector scheme [H ~> m]. 
+
   real, dimension(SZI_(G),SZJ_(G)), optional, intent(out) :: etaav        !< The free surface height or column mass
                                                          !! averaged over the barotropic integration [H ~> m or kg m-2].
 
@@ -510,7 +521,7 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
     e_anom        ! The anomaly in the sea surface height or column mass
                   ! averaged between the beginning and end of the time step,
                   ! relative to eta_PF, with SAL effects included [H ~> m or kg m-2].
-
+  
   ! These are always allocated with symmetric memory and wide halos.
   real :: q(SZIBW_(CS),SZJBW_(CS))  ! A pseudo potential vorticity [T-1 Z-1 ~> s-1 m-1]
                   ! or [T-1 H-1 ~> s-1 m-1 or m2 s-1 kg-1]
@@ -680,6 +691,9 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
                                ! in roundoff and can be neglected [H ~> m or kg m-2].
   real :: Idtbt       ! The inverse of the barotropic time step [T-1 ~> s-1]
 
+  real, dimension(:,:,:), allocatable :: &
+  e_SAL_pred_BT    ! The SSH perturbations from SAL on barotropic time steps [Z ~> m].
+
   real, allocatable :: wt_vel(:)    ! The raw or relative weights of each of the barotropic timesteps
                                     ! in determining the average velocities [nondim]
   real, allocatable :: wt_eta(:)    ! The raw or relative weights of each of the barotropic timesteps
@@ -785,6 +799,10 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
     call MOM_mesg(mesg, 3)
   endif
   CS%nstep_last = nstep
+
+  if ((CS%calculate_SAL) .and. (CS%use_SAL_PCM)) then
+    allocate(e_SAL_pred_BT(SZI_(G),SZJ_(G),nstep))
+  endif
 
   ! Set the actual barotropic time step.
   Instep = 1.0 / real(nstep)
@@ -1770,6 +1788,31 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
 
   sum_wt_vel = 0.0 ; sum_wt_eta = 0.0 ; sum_wt_accel = 0.0 ; sum_wt_trans = 0.0
 
+  ! Determine SAL SSH perturbations for barotropic time steps, if asked to
+  if (CS%use_SAL_pcm) then
+    ! Use a predictor or corrector function to predict e_SAL_only value at next BC time step
+    if (pred_corr_T_F) then
+      !$OMP do
+      do j=Jsq,Jeq+1 ; do i=Isq,Ieq+1
+        e_SAL_pred_BT_last(i,j) = e_sal_pred(i,j,1) + 1.5 * dt * e_sal_pred(i,j,1) - &
+        0.5 * dt * e_sal_pred(i,j,2)
+      enddo ; enddo
+    else
+      !$OMP do
+      do j=Jsq,Jeq+1 ; do i=Isq,Ieq+1
+        e_SAL_pred_BT_last(i,j) = e_sal_pred(i,j,2) + (5.0/12.0) * dt * e_sal_pred(i,j,1) + &
+        (8.0/12.0) * dt * e_sal_pred(i,j,2) - (1.0/12.0) * dt * e_sal_pred(i,j,3)     ! need to add parentheses here
+      enddo ; enddo
+    endif
+    ! Define e_SAL_pred_BT here, for all BT time steps, interpolating between e_SAL_pred values.
+    ! Currently a linear interpolation
+    ! do j=Jsq,Jeq+1 ; do i=Isq,Ieq+1 ; do n = 1, nstep
+    !   e_SAL_pred_BT(i,j,n) = e_sal_pred(i,j,1) + ((e_SAL_pred_BT(i,j,nstep) - e_sal_pred(i,j,1)) * (Instep * n))
+    ! enddo ; enddo ; enddo
+    ! Now, must use e_SAL_pred_BT to calculate pressure gradients from SAL SSH on BT time steps.
+    ! This starts on line 1970
+  endif
+
   ! The following loop contains all of the time steps.
   isv=is ; iev=ie ; jsv=js ; jev=je
   do n=1,nstep+nfilter
@@ -1933,14 +1976,31 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
 
     if (MOD(n+G%first_direction,2)==1) then
       ! On odd-steps, update v first.
-      !$OMP do schedule(static)
-      do J=jsv-1,jev ; do i=isv-1,iev+1
-        Cor_v(i,J) = -1.0*((amer(I-1,j) * ubt(I-1,j) + cmer(I,j+1) * ubt(I,j+1)) + &
-               (bmer(I,j) * ubt(I,j) + dmer(I-1,j+1) * ubt(I-1,j+1))) - Cor_ref_v(i,J)
-        PFv(i,J) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_N(i,j) - &
-                     (eta_PF_BT(i,j+1)-eta_PF(i,j+1))*gtot_S(i,j+1)) * &
-                   dgeo_de * CS%IdyCv(i,J)
-      enddo ; enddo
+      if (CS%use_SAL_pcm) then
+        !$OMP do schedule(static)
+        do J=jsv-1,jev ; do i=isv-1,iev+1
+          Cor_v(i,J) = -1.0*((amer(I-1,j) * ubt(I-1,j) + cmer(I,j+1) * ubt(I,j+1)) + &
+                (bmer(I,j) * ubt(I,j) + dmer(I-1,j+1) * ubt(I-1,j+1))) - Cor_ref_v(i,J)
+          PFv(i,J) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_N(i,j) - &
+                      (eta_PF_BT(i,j+1)-eta_PF(i,j+1))*gtot_S(i,j+1)) * &
+                    dgeo_de * CS%IdyCv(i,J) + &
+                    ((e_SAL_pred_BT_last(i,j) - e_sal_pred(i,j,1)) - &
+                    (e_SAL_pred_BT_last(i,j+1) - e_sal_pred(i,j+1,1))) * &
+                    (Instep * (n - 1)) * CS%GFS * CS%IdyCv(i,J)
+        enddo ; enddo
+        !$OMP end do nowait
+      else
+        !$OMP do schedule(static)
+        do J=jsv-1,jev ; do i=isv-1,iev+1
+          Cor_v(i,J) = -1.0*((amer(I-1,j) * ubt(I-1,j) + cmer(I,j+1) * ubt(I,j+1)) + &
+                (bmer(I,j) * ubt(I,j) + dmer(I-1,j+1) * ubt(I-1,j+1))) - Cor_ref_v(i,J)
+          PFv(i,J) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_N(i,j) - &
+                    (eta_PF_BT(i,j+1)-eta_PF(i,j+1))*gtot_S(i,j+1)) * &
+                    dgeo_de * CS%IdyCv(i,J)
+        enddo ; enddo
+        !$OMP end do nowait
+      endif
+
       !$OMP end do nowait
       if (CS%dynamic_psurf) then
         !$OMP do schedule(static)
@@ -2008,6 +2068,7 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
         endif ; enddo ; enddo
       endif
       ! Now update the zonal velocity.
+      if (CS%use_SAL_pcm) then
       !$OMP do schedule(static)
       do j=jsv,jev ; do I=isv-1,iev
         Cor_u(I,j) = ((azon(I,j) * vbt(i+1,J) + czon(I,j) * vbt(i,J-1)) + &
@@ -2015,9 +2076,24 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
                      Cor_ref_u(I,j)
         PFu(I,j) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_E(i,j) - &
                      (eta_PF_BT(i+1,j)-eta_PF(i+1,j))*gtot_W(i+1,j)) * &
-                    dgeo_de * CS%IdxCu(I,j)
+                    dgeo_de * CS%IdxCu(I,j) + &
+                    ((e_SAL_pred_BT_last(i,j) - e_sal_pred(i,j,1)) - &
+                    (e_SAL_pred_BT_last(i+1,j) - e_sal_pred(i+1,j,1))) * &
+                    (Instep * (n - 1)) * CS%GFS * CS%IdxCu(I,j)
       enddo ; enddo
       !$OMP end do nowait
+      else
+        !$OMP do schedule(static)
+        do j=jsv,jev ; do I=isv-1,iev
+          Cor_u(I,j) = ((azon(I,j) * vbt(i+1,J) + czon(I,j) * vbt(i,J-1)) + &
+                        (bzon(I,j) * vbt(i,J) + dzon(I,j) * vbt(i+1,J-1))) - &
+                      Cor_ref_u(I,j)
+          PFu(I,j) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_E(i,j) - &
+                      (eta_PF_BT(i+1,j)-eta_PF(i+1,j))*gtot_W(i+1,j)) * &
+                      dgeo_de * CS%IdxCu(I,j)
+        enddo ; enddo
+        !$OMP end do nowait
+      endif
 
       if (CS%dynamic_psurf) then
         !$OMP do schedule(static)
@@ -2087,16 +2163,32 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
       endif
     else
       ! On even steps, update u first.
+      if (CS%use_SAL_pcm) then
+        !$OMP do schedule(static)
+        do j=jsv-1,jev+1 ; do I=isv-1,iev
+          Cor_u(I,j) = ((azon(I,j) * vbt(i+1,J) + czon(I,j) * vbt(i,J-1)) + &
+                        (bzon(I,j) * vbt(i,J) +  dzon(I,j) * vbt(i+1,J-1))) - &
+                        Cor_ref_u(I,j)
+          PFu(I,j) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_E(i,j) - &
+                        (eta_PF_BT(i+1,j)-eta_PF(i+1,j))*gtot_W(i+1,j)) * &
+                        dgeo_de * CS%IdxCu(I,j) + &
+                        ((e_SAL_pred_BT_last(i,j) - e_sal_pred(i,j,1)) - &
+                        (e_SAL_pred_BT_last(i+1,j) - e_sal_pred(i+1,j,1))) * &
+                        (Instep * (n - 1)) * CS%GFS * CS%IdxCu(I,j)
+        enddo ; enddo
+        !$OMP end do nowait
+      else
       !$OMP do schedule(static)
-      do j=jsv-1,jev+1 ; do I=isv-1,iev
-        Cor_u(I,j) = ((azon(I,j) * vbt(i+1,J) + czon(I,j) * vbt(i,J-1)) + &
-                      (bzon(I,j) * vbt(i,J) +  dzon(I,j) * vbt(i+1,J-1))) - &
-                     Cor_ref_u(I,j)
-        PFu(I,j) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_E(i,j) - &
-                     (eta_PF_BT(i+1,j)-eta_PF(i+1,j))*gtot_W(i+1,j)) * &
-                     dgeo_de * CS%IdxCu(I,j)
-      enddo ; enddo
-      !$OMP end do nowait
+        do j=jsv-1,jev+1 ; do I=isv-1,iev
+          Cor_u(I,j) = ((azon(I,j) * vbt(i+1,J) + czon(I,j) * vbt(i,J-1)) + &
+                        (bzon(I,j) * vbt(i,J) +  dzon(I,j) * vbt(i+1,J-1))) - &
+                       Cor_ref_u(I,j)
+          PFu(I,j) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_E(i,j) - &
+                       (eta_PF_BT(i+1,j)-eta_PF(i+1,j))*gtot_W(i+1,j)) * &
+                       dgeo_de * CS%IdxCu(I,j)
+        enddo ; enddo
+        !$OMP end do nowait
+      endif
 
       if (CS%dynamic_psurf) then
         !$OMP do schedule(static)
@@ -2165,25 +2257,55 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
 
       ! Now update the meridional velocity.
       if (CS%use_old_coriolis_bracket_bug) then
-        !$OMP do schedule(static)
-        do J=jsv-1,jev ; do i=isv,iev
-          Cor_v(i,J) = -1.0*((amer(I-1,j) * ubt(I-1,j) + bmer(I,j) * ubt(I,j)) + &
-                  (cmer(I,j+1) * ubt(I,j+1) + dmer(I-1,j+1) * ubt(I-1,j+1))) - Cor_ref_v(i,J)
-          PFv(i,J) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_N(i,j) - &
-                       (eta_PF_BT(i,j+1)-eta_PF(i,j+1))*gtot_S(i,j+1)) * &
-                      dgeo_de * CS%IdyCv(i,J)
-        enddo ; enddo
-        !$OMP end do nowait
+        if (CS%use_SAL_pcm) then
+          !$OMP do schedule(static)
+          do J=jsv-1,jev ; do i=isv,iev
+            Cor_v(i,J) = -1.0*((amer(I-1,j) * ubt(I-1,j) + bmer(I,j) * ubt(I,j)) + &
+                    (cmer(I,j+1) * ubt(I,j+1) + dmer(I-1,j+1) * ubt(I-1,j+1))) - Cor_ref_v(i,J)
+            PFv(i,J) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_N(i,j) - &
+                        (eta_PF_BT(i,j+1)-eta_PF(i,j+1))*gtot_S(i,j+1)) * &
+                        dgeo_de * CS%IdyCv(i,J) + &
+                        ((e_SAL_pred_BT_last(i,j) - e_sal_pred(i,j,1)) - &
+                        (e_SAL_pred_BT_last(i,j+1) - e_sal_pred(i,j+1,1))) * &
+                        (Instep * (n - 1)) * CS%GFS * CS%IdyCv(i,J)
+          enddo ; enddo
+          !$OMP end do nowait
+        else
+          !$OMP do schedule(static)
+          do J=jsv-1,jev ; do i=isv,iev
+            Cor_v(i,J) = -1.0*((amer(I-1,j) * ubt(I-1,j) + bmer(I,j) * ubt(I,j)) + &
+                    (cmer(I,j+1) * ubt(I,j+1) + dmer(I-1,j+1) * ubt(I-1,j+1))) - Cor_ref_v(i,J)
+            PFv(i,J) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_N(i,j) - &
+                        (eta_PF_BT(i,j+1)-eta_PF(i,j+1))*gtot_S(i,j+1)) * &
+                        dgeo_de * CS%IdyCv(i,J)
+          enddo ; enddo
+          !$OMP end do nowait
+        endif
       else
-        !$OMP do schedule(static)
-        do J=jsv-1,jev ; do i=isv,iev
-          Cor_v(i,J) = -1.0*((amer(I-1,j) * ubt(I-1,j) + cmer(I,j+1) * ubt(I,j+1)) + &
-                  (bmer(I,j) * ubt(I,j) + dmer(I-1,j+1) * ubt(I-1,j+1))) - Cor_ref_v(i,J)
-          PFv(i,J) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_N(i,j) - &
-                       (eta_PF_BT(i,j+1)-eta_PF(i,j+1))*gtot_S(i,j+1)) * &
-                      dgeo_de * CS%IdyCv(i,J)
-        enddo ; enddo
-        !$OMP end do nowait
+        if (CS%use_SAL_pcm) then
+          !$OMP do schedule(static)
+          do J=jsv-1,jev ; do i=isv,iev
+            Cor_v(i,J) = -1.0*((amer(I-1,j) * ubt(I-1,j) + cmer(I,j+1) * ubt(I,j+1)) + &
+                    (bmer(I,j) * ubt(I,j) + dmer(I-1,j+1) * ubt(I-1,j+1))) - Cor_ref_v(i,J)
+            PFv(i,J) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_N(i,j) - &
+                        (eta_PF_BT(i,j+1)-eta_PF(i,j+1))*gtot_S(i,j+1)) * &
+                        dgeo_de * CS%IdyCv(i,J) + &
+                        ((e_SAL_pred_BT_last(i,j) - e_sal_pred(i,j,1)) - &
+                        (e_SAL_pred_BT_last(i,j+1) - e_sal_pred(i,j+1,1))) * &
+                        (Instep * (n - 1)) * CS%GFS * CS%IdyCv(i,J)
+          enddo ; enddo
+          !$OMP end do nowait
+        else
+          !$OMP do schedule(static)
+          do J=jsv-1,jev ; do i=isv,iev
+            Cor_v(i,J) = -1.0*((amer(I-1,j) * ubt(I-1,j) + cmer(I,j+1) * ubt(I,j+1)) + &
+                    (bmer(I,j) * ubt(I,j) + dmer(I-1,j+1) * ubt(I-1,j+1))) - Cor_ref_v(i,J)
+            PFv(i,J) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_N(i,j) - &
+                        (eta_PF_BT(i,j+1)-eta_PF(i,j+1))*gtot_S(i,j+1)) * &
+                        dgeo_de * CS%IdyCv(i,J)
+          enddo ; enddo
+          !$OMP end do nowait
+        endif
       endif
 
       if (CS%dynamic_psurf) then
@@ -4326,6 +4448,7 @@ subroutine barotropic_init(u, v, h, eta, Time, G, GV, US, param_file, diag, CS, 
                       ! This is typically ~0.09 or less.
   real, allocatable :: lin_drag_h(:,:)  ! A spatially varying linear drag coefficient at tracer points
                                         ! that acts on the barotropic flow [Z T-1 ~> m s-1].
+  ! real :: GFS         ! Reduced gravity across the free surface [L2 Z-1 T-2 ~> m s-2].
 
   type(memory_size_type) :: MS
   type(group_pass_type) :: pass_static_data, pass_q_D_Cor
@@ -4369,6 +4492,10 @@ subroutine barotropic_init(u, v, h, eta, Time, G, GV, US, param_file, diag, CS, 
   call get_param(param_file, mdl, "SPLIT", CS%split, &
                  "Use the split time stepping if true.", default=.true.)
   if (.not.CS%split) return
+
+  call get_param(param_file, mdl, "GFS" , CS%GFS, &
+                 "The reduced gravity at the free surface.", units="m s-2", &
+                 default=GV%g_Earth*US%L_T_to_m_s**2*US%m_to_Z, scale=US%m_s_to_L_T**2*US%Z_to_m)
 
   call get_param(param_file, mdl, "USE_BT_CONT_TYPE", use_BT_cont_type, &
                  "If true, use a structure with elements that describe "//&
@@ -4492,6 +4619,9 @@ subroutine barotropic_init(u, v, h, eta, Time, G, GV, US, param_file, diag, CS, 
                  "If true, apply tidal momentum forcing.", default=.false.)
   call get_param(param_file, mdl, "CALCULATE_SAL", CS%calculate_SAL, &
                  "If true, calculate self-attraction and loading.", default=use_tides)
+  call get_param(param_file, mdl, "USE_SAL_PCM", CS%use_SAL_pcm, &
+                 "If true, use a predictor-corrector method for calculating pressure force "//&
+                  "due to SAL on barotropic time steps.", default=.false.)
   det_de = 0.0
   if (CS%calculate_SAL .and. associated(CS%SAL_CSp)) &
     call scalar_SAL_sensitivity(CS%SAL_CSp, det_de)
