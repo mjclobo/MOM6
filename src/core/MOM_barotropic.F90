@@ -1993,7 +1993,7 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
                 (bmer(I,j) * ubt(I,j) + dmer(I-1,j+1) * ubt(I-1,j+1))) - Cor_ref_v(i,J)
           PFv(i,J) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_N(i,j) - &
                       (eta_PF_BT(i,j+1)-eta_PF(i,j+1))*gtot_S(i,j+1)) * &
-                    dgeo_de * CS%IdyCv(i,J) + &
+                    dgeo_de * CS%IdyCv(i,J) - &
                     ((e_SAL_pred_BT_last(i,j) - e_sal_pred(i,j,1)) - &
                     (e_SAL_pred_BT_last(i,j+1) - e_sal_pred(i,j+1,1))) * &
                     (Instep * (n - 1)) * CS%GFS * CS%IdyCv(i,J)
@@ -2086,7 +2086,7 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
                      Cor_ref_u(I,j)
         PFu(I,j) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_E(i,j) - &
                      (eta_PF_BT(i+1,j)-eta_PF(i+1,j))*gtot_W(i+1,j)) * &
-                    dgeo_de * CS%IdxCu(I,j) + &
+                    dgeo_de * CS%IdxCu(I,j) - &
                     ((e_SAL_pred_BT_last(i,j) - e_sal_pred(i,j,1)) - &
                     (e_SAL_pred_BT_last(i+1,j) - e_sal_pred(i+1,j,1))) * &
                     (Instep * (n - 1)) * CS%GFS * CS%IdxCu(I,j)
@@ -2181,7 +2181,7 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
                         Cor_ref_u(I,j)
           PFu(I,j) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_E(i,j) - &
                         (eta_PF_BT(i+1,j)-eta_PF(i+1,j))*gtot_W(i+1,j)) * &
-                        dgeo_de * CS%IdxCu(I,j) + &
+                        dgeo_de * CS%IdxCu(I,j) - &
                         ((e_SAL_pred_BT_last(i,j) - e_sal_pred(i,j,1)) - &
                         (e_SAL_pred_BT_last(i+1,j) - e_sal_pred(i+1,j,1))) * &
                         (Instep * (n - 1)) * CS%GFS * CS%IdxCu(I,j)
@@ -2274,7 +2274,7 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
                     (cmer(I,j+1) * ubt(I,j+1) + dmer(I-1,j+1) * ubt(I-1,j+1))) - Cor_ref_v(i,J)
             PFv(i,J) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_N(i,j) - &
                         (eta_PF_BT(i,j+1)-eta_PF(i,j+1))*gtot_S(i,j+1)) * &
-                        dgeo_de * CS%IdyCv(i,J) + &
+                        dgeo_de * CS%IdyCv(i,J) - &
                         ((e_SAL_pred_BT_last(i,j) - e_sal_pred(i,j,1)) - &
                         (e_SAL_pred_BT_last(i,j+1) - e_sal_pred(i,j+1,1))) * &
                         (Instep * (n - 1)) * CS%GFS * CS%IdyCv(i,J)
@@ -2299,7 +2299,7 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
                     (bmer(I,j) * ubt(I,j) + dmer(I-1,j+1) * ubt(I-1,j+1))) - Cor_ref_v(i,J)
             PFv(i,J) = ((eta_PF_BT(i,j)-eta_PF(i,j))*gtot_N(i,j) - &
                         (eta_PF_BT(i,j+1)-eta_PF(i,j+1))*gtot_S(i,j+1)) * &
-                        dgeo_de * CS%IdyCv(i,J) + &
+                        dgeo_de * CS%IdyCv(i,J) - &
                         ((e_SAL_pred_BT_last(i,j) - e_sal_pred(i,j,1)) - &
                         (e_SAL_pred_BT_last(i,j+1) - e_sal_pred(i,j+1,1))) * &
                         (Instep * (n - 1)) * CS%GFS * CS%IdyCv(i,J)
